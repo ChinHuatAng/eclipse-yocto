@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+   <extension
+       id="CommandLauncherFactories"
+       name="%ContainerCommandLauncherFactory.name"
+       point="org.eclipse.cdt.core.CommandLauncherFactory">
+       <factory
+          id="ContainerCommandLauncherFactory"
+          class="org.yocto.crops.docker.launcher.YoctoCropsContainerCommandLauncherFactory"
+          priority="10">
+      </factory>
+   </extension>
+</plugin>
