@@ -52,6 +52,7 @@
 		<module>plugins/org.yocto.sdk.remotetools</module>
 		-->
 		<module>plugins/org.yocto.doc.user</module>
+		<module>plugins/org.yocto.crops.docker.launcher</module>
 		<module>features/org.yocto.sdk</module>
 		<module>features/org.yocto.utils</module>
 		<module>features/org.yocto.doc</module>
