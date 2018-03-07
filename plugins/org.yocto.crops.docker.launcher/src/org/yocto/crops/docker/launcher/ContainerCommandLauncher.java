@@ -232,7 +232,12 @@ public class ContainerCommandLauncher
 					}
 				}
 			}
-			b.append(realArg);
+			
+			if (realArg.contains(" ")) {
+				b.append('"' + realArg + '"');
+			} else {
+				b.append(realArg);
+			}
 			commandSegments.add(realArg);
 		}
 		
