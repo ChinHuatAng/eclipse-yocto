@@ -13,6 +13,7 @@ package org.yocto.crops.docker.launcher.ui;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -24,11 +25,13 @@ import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OutputStream;
+//import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -97,8 +100,11 @@ public class ContainerLauncher {
 
 	private static RunConsole console;
 
+//	private static Map<IProject, ID> fidMap = new HashMap<>();
+
 	private static Object lockObject = new Object();
 	private static Map<String, Map<String, Set<String>>> copiedVolumesMap = null;
+	private static Map<String, Map<String, Set<String>>> copyingVolumesMap = null;
 
 	private class CopyVolumesJob extends Job {
 
@@ -168,6 +174,22 @@ public class ContainerLauncher {
 
 	}
 
+	/**
+	 * A blocking input stream that waits until data is available.
+	 */
+	private class BlockingInputStream extends InputStream {
+		private InputStream in;
+
+		public BlockingInputStream(InputStream in) {
+			this.in = in;
+		}
+
+		@Override
+		public int read() throws IOException {
+			return in.read();
+		}
+	}
+
 	private class CopyVolumesFromImageJob extends Job {
 
 		private static final String COPY_VOLUMES_FROM_JOB_TITLE = "ContainerLaunch.copyVolumesFromJob.title"; //$NON-NLS-1$
@@ -175,20 +197,25 @@ public class ContainerLauncher {
 		private static final String COPY_VOLUMES_FROM_TASK = "ContainerLaunch.copyVolumesFromJob.task"; //$NON-NLS-1$
 
 		private final List<String> volumes;
+		private final List<String> excludedDirs;
 		private final IDockerConnection connection;
 		private final String image;
 		private final IPath target;
 		private Set<String> dirList;
+		private Set<String> copyingList;
 
 		public CopyVolumesFromImageJob(
 				IDockerConnection connection,
-				String image, List<String> volumes, IPath target) {
+				String image, List<String> volumes, List<String> excludedDirs,
+				IPath target) {
 			super(Messages.getString(COPY_VOLUMES_FROM_JOB_TITLE));
 			this.volumes = volumes;
+			this.excludedDirs = excludedDirs;
 			this.connection = connection;
 			this.image = image;
 			this.target = target;
 			Map<String, Set<String>> dirMap = null;
+			Map<String, Set<String>> copyingMap = null;
 			synchronized (lockObject) {
 				String uri = connection.getUri();
 				dirMap = copiedVolumesMap.get(uri);
@@ -198,8 +225,18 @@ public class ContainerLauncher {
 				}
 				dirList = dirMap.get(image);
 				if (dirList == null) {
-					dirList = new HashSet<>();
+					dirList = new LinkedHashSet<>();
 					dirMap.put(image, dirList);
+				}
+				copyingMap = copyingVolumesMap.get(uri);
+				if (copyingMap == null) {
+					copyingMap = new HashMap<>();
+					copyingVolumesMap.put(uri, copyingMap);
+				}
+				copyingList = copyingMap.get(image);
+				if (copyingList == null) {
+					copyingList = new LinkedHashSet<>();
+					copyingMap.put(image, copyingList);
 				}
 			}
 		}
@@ -210,6 +247,12 @@ public class ContainerLauncher {
 					Messages.getFormattedString(COPY_VOLUMES_FROM_DESC, image),
 					volumes.size());
 			String containerId = null;
+			String currentVolume = null;
+			
+			// keep a list of already copied/being copied volumes so we can skip them and wait at the end to
+			// make sure if another job was copying them, it has finished
+			List<String> alreadyCopiedList = new ArrayList<>();
+			
 			try {
 				IDockerImage dockerImage = ((DockerConnection) connection)
 						.getImageByTag(image);
@@ -227,7 +270,10 @@ public class ContainerLauncher {
 						if (!dockerImage.id().equals(imageId)) {
 							// if image id has changed...all bets are off
 							// and we must reload all directories
-							dirList.clear();
+							synchronized (lockObject) {
+								dirList.clear();
+								copyingList.clear();
+							}
 							needImageIdFile = true;
 						}
 					} catch (IOException e) {
@@ -240,10 +286,55 @@ public class ContainerLauncher {
 									writer);) {
 						bufferedWriter.write(dockerImage.id());
 						bufferedWriter.newLine();
+						synchronized (lockObject) {
+							dirList.clear();
+							copyingList.clear();
+						}
 					} catch (IOException e) {
 						// ignore
 					}
 				}
+
+				// check if we have anything to copy
+				boolean somethingToCopy = false;
+				synchronized (lockObject) {
+					for (String volume : volumes) {
+						boolean excluded = false;
+						for (String dir : excludedDirs) {
+							if (volume.startsWith(dir) && volume.charAt(
+									dir.length()) == File.separatorChar) {
+								excluded = true;
+								break;
+							}
+						}
+						if (excluded) {
+							continue;
+						}
+						boolean alreadyCopied = false;
+						for (String path : dirList) {
+							if (volume.equals(path) || (volume.startsWith(path)
+									&& volume.charAt(path
+											.length()) == File.separatorChar)) {
+								if (!copyingList.contains(path)) {
+									alreadyCopied = true;
+									break;
+								}
+							}
+						}
+						if (!alreadyCopied) {
+							somethingToCopy = true;
+							break;
+						}
+					}
+				}
+
+				// if nothing to copy, don't waste time creating a Container
+				if (!somethingToCopy) {
+					monitor.done();
+					return Status.OK_STATUS;
+				}
+
+				// create base container to use for copying
 				DockerContainerConfig.Builder builder = new DockerContainerConfig.Builder()
 						.cmd("/bin/sh").image(image); //$NON-NLS-1$
 				IDockerContainerConfig config = builder.build();
@@ -251,7 +342,10 @@ public class ContainerLauncher {
 				IDockerHostConfig hostConfig = hostBuilder.build();
 				containerId = ((DockerConnection) connection)
 						.createContainer(config, hostConfig, null);
+				
+				// copy each volume if it exists and is not copied over yet
 				for (String volume : volumes) {
+					currentVolume = volume;
 					if (monitor.isCanceled()) {
 						monitor.done();
 						return Status.CANCEL_STATUS;
@@ -261,83 +355,143 @@ public class ContainerLauncher {
 						monitor.worked(1);
 						continue;
 					}
+					// don't copy directories that are excluded
+					boolean excluded = false;
+					for (String dir : excludedDirs) {
+						if (volume.equals(dir)
+								|| (volume.startsWith(dir) && volume.charAt(
+										dir.length()) == File.separatorChar)) {
+							excluded = true;
+							break;
+						}
+					}
+					if (excluded) {
+						monitor.worked(1);
+						continue;
+					}
 					// if we have already copied the directory either directly
 					// or as part of a parent directory copy, then skip to next
 					// volume.
-					for (String path : dirList) {
-						if (volume.equals(path)
-								|| (volume.startsWith(path) && volume.charAt(
-										path.length()) == File.separatorChar)) {
-							monitor.worked(1);
-							continue;
+					String alreadyCopied = null;
+					synchronized (lockObject) {
+						for (String path : dirList) {
+							if (volume.equals(path) || (volume.startsWith(path)
+									&& volume.charAt(path
+											.length()) == File.separatorChar)) {
+								alreadyCopied = path;
+								if (!dirList.contains(volume)) {
+									dirList.add(volume);
+								}
+								break;
+							}
 						}
 					}
-					try {
-						monitor.setTaskName(Messages.getFormattedString(
-								COPY_VOLUMES_FROM_TASK, volume));
+
+					// if we found a match, make sure it is finished copying
+					// before continuing
+					if (alreadyCopied != null) {
+						alreadyCopiedList.add(alreadyCopied);
 						monitor.worked(1);
+						continue;
+					}
+
+					// synchronize on the volume so others can wait until copy
+					// is completed
+					// instead of returning too fast and the headers won't be
+					// there
+					synchronized (volume) {
+						try (Closeable token = ((DockerConnection) connection)
+								.getOperationToken()) {
+							monitor.setTaskName(Messages.getFormattedString(
+									COPY_VOLUMES_FROM_TASK, volume));
+							monitor.worked(1);
 
 
-						InputStream in = ((DockerConnection) connection)
-								.copyContainer(containerId, volume);
+							InputStream in = ((DockerConnection) connection)
+									.copyContainer(token, containerId, volume);
 
-						synchronized (lockObject) {
-							dirList.add(volume);
-						}
-
-						/*
-						 * The input stream from copyContainer might be
-						 * incomplete or non-blocking so we should wrap it in a
-						 * stream that is guaranteed to block until data is
-						 * available.
-						 */
-						TarArchiveInputStream k = new TarArchiveInputStream(
-								new BlockingInputStream(in));
-						TarArchiveEntry te = null;
-						target.toFile().mkdirs();
-						IPath currDir = target.append(volume)
-								.removeLastSegments(1);
-						currDir.toFile().mkdirs();
-						while ((te = k.getNextTarEntry()) != null) {
-							long size = te.getSize();
-							IPath path = currDir;
-							path = path.append(te.getName());
-							File f = new File(path.toOSString());
-							if (te.isDirectory()) {
-								f.mkdir();
-								continue;
-							} else {
-								f.createNewFile();
-							}
-							FileOutputStream os = new FileOutputStream(f);
-							int bufferSize = ((int) size > 4096 ? 4096
-									: (int) size);
-							byte[] barray = new byte[bufferSize];
-							int result = -1;
-							while ((result = k.read(barray, 0,
-									bufferSize)) > -1) {
-								if (monitor.isCanceled()) {
-									monitor.done();
-									k.close();
-									os.close();
-									return Status.CANCEL_STATUS;
+							synchronized (lockObject) {
+								if (!dirList.contains(volume)) {
+									dirList.add(volume);
+									copyingList.add(volume);
+								} else {
+									continue;
 								}
-								os.write(barray, 0, result);
 							}
-							os.close();
+
+							/*
+							 * The input stream from copyContainer might be
+							 * incomplete or non-blocking so we should wrap it
+							 * in a stream that is guaranteed to block until
+							 * data is available.
+							 */
+							TarArchiveInputStream k = new TarArchiveInputStream(
+									new BlockingInputStream(in));
+							TarArchiveEntry te = null;
+							target.toFile().mkdirs();
+							IPath currDir = target.append(volume)
+									.removeLastSegments(1);
+							currDir.toFile().mkdirs();
+							while ((te = k.getNextTarEntry()) != null) {
+								long size = te.getSize();
+								IPath path = currDir;
+								path = path.append(te.getName());
+								File f = new File(path.toOSString());
+								if (te.isDirectory()) {
+									f.mkdir();
+									continue;
+								} else {
+									f.createNewFile();
+								}
+								FileOutputStream os = new FileOutputStream(f);
+								int bufferSize = ((int) size > 4096 ? 4096
+										: (int) size);
+								byte[] barray = new byte[bufferSize];
+								int result = -1;
+								while ((result = k.read(barray, 0,
+										bufferSize)) > -1) {
+									if (monitor.isCanceled()) {
+										monitor.done();
+										k.close();
+										os.close();
+										return Status.CANCEL_STATUS;
+									}
+									os.write(barray, 0, result);
+								}
+								os.close();
+							}
+							k.close();
+							// remove from copying list so subsequent jobs might
+							// know that the volume
+							// is fully copied
+							synchronized (lockObject) {
+								copyingList.remove(currentVolume);
+							}
+						} catch (final DockerException e) {
+							// ignore
+							synchronized (lockObject) {
+								copyingList.remove(currentVolume);
+								dirList.remove(currentVolume);
+							}
 						}
-						k.close();
-					} catch (final DockerException e) {
-						// ignore
 					}
 				}
 			} catch (InterruptedException e) {
 				// do nothing
-			} catch (IOException e) {
+			} catch (IOException | DockerException e) {
+				if (currentVolume != null) {
+					synchronized (lockObject) {
+						if (copyingList != null) {
+							copyingList.remove(currentVolume);
+						}
+						if (dirList != null) {
+							dirList.remove(currentVolume);
+						}
+					}
+				}
 				Activator.log(e);
-			} catch (DockerException e1) {
-				Activator.log(e1);
 			} finally {
+				// remove the container used for copying
 				if (containerId != null) {
 					try {
 						((DockerConnection) connection)
@@ -346,25 +500,19 @@ public class ContainerLauncher {
 						// ignore
 					}
 				}
+				for (String copiedVolume : alreadyCopiedList) {
+					synchronized (copiedVolume) {
+						// do something so synchronization will occur
+						synchronized (lockObject) {
+							if (!dirList.contains(copiedVolume)) {
+								dirList.add(copiedVolume);
+							}
+						}
+					}
+				}
 				monitor.done();
 			}
 			return Status.OK_STATUS;
-		}
-	}
-
-	/**
-	 * A blocking input stream that waits until data is available.
-	 */
-	private class BlockingInputStream extends InputStream {
-		private InputStream in;
-
-		public BlockingInputStream(InputStream in) {
-			this.in = in;
-		}
-
-		@Override
-		public int read() throws IOException {
-			return in.read();
 		}
 	}
 
@@ -416,6 +564,9 @@ public class ContainerLauncher {
 			}
 			if (copiedVolumesMap == null) {
 				copiedVolumesMap = new HashMap<>();
+			}
+			if (copyingVolumesMap == null) {
+				copyingVolumesMap = new HashMap<>();
 			}
 		}
 	}
@@ -618,7 +769,60 @@ public class ContainerLauncher {
 	 */
 	public void launch(String id, IContainerLaunchListener listener,
 			final String connectionUri, String image, String command,
-			String commandDir, String workingDir, List<String> additionalDirs,
+			@SuppressWarnings("unused") String commandDir, String workingDir,
+			List<String> additionalDirs,
+			Map<String, String> origEnv, Map<String, String> envMap,
+			List<String> ports, boolean keep, boolean stdinSupport,
+			boolean privilegedMode, Map<String, String> labels,
+			String seccomp) {
+
+		final List<String> cmdList = getCmdList(command);
+
+		launch(id, listener, connectionUri, image, cmdList, workingDir,
+				additionalDirs, origEnv, envMap, ports, keep, stdinSupport,
+				privilegedMode, labels, seccomp);
+	}
+
+	/**
+	 * Perform a launch of a command in a container and output stdout/stderr to
+	 * console.
+	 * 
+	 * @param id
+	 *            - id of caller to use to distinguish console owner
+	 * @param listener
+	 *            - optional listener of the run console
+	 * @param connectionUri
+	 *            - the specified connection to use
+	 * @param image
+	 *            - the image to use
+	 * @param cmdList
+	 *            - command to run as list of String
+	 * @param workingDir
+	 *            - working directory or null
+	 * @param additionalDirs
+	 *            - additional directories to mount or null
+	 * @param origEnv
+	 *            - original environment if we are appending to our existing
+	 *            environment
+	 * @param envMap
+	 *            - map of environment variable settings
+	 * @param ports
+	 *            - ports to expose
+	 * @param keep
+	 *            - keep container after running
+	 * @param stdinSupport
+	 *            - true if stdin support is required, false otherwise
+	 * @param privilegedMode
+	 *            - true if privileged mode is required, false otherwise
+	 * @param labels
+	 *            - Map of labels for the container
+	 * @param seccomp
+	 *            - seccomp profile
+	 * @since 4.0
+	 */
+	public void launch(String id, IContainerLaunchListener listener,
+			final String connectionUri, String image, List<String> cmdList,
+			String workingDir, List<String> additionalDirs,
 			Map<String, String> origEnv, Map<String, String> envMap,
 			List<String> ports, boolean keep, boolean stdinSupport,
 			boolean privilegedMode, Map<String, String> labels,
@@ -630,9 +834,6 @@ public class ContainerLauncher {
 		final List<String> env = new ArrayList<>();
 		env.addAll(toList(origEnv));
 		env.addAll(toList(envMap));
-
-
-		final List<String> cmdList = getCmdList(command);
 
 		final Set<String> exposedPorts = new HashSet<>();
 		final Map<String, List<IDockerPortBinding>> portBindingsMap = new HashMap<>();
@@ -746,7 +947,8 @@ public class ContainerLauncher {
 
 		final Map<String, String> remoteVolumes = new HashMap<>();
 		if (!((DockerConnection) connection).isLocal()) {
-			final Set<String> volumes = new HashSet<>();
+			@SuppressWarnings("rawtypes")
+			final Map<String,Map> volumes = new HashMap<>();
 			// if using remote daemon, we have to
 			// handle volume mounting differently.
 			// Instead we mount empty volumes and copy
@@ -754,16 +956,12 @@ public class ContainerLauncher {
 			if (additionalDirs != null) {
 				for (String dir : additionalDirs) {
 					remoteVolumes.put(dir, dir);
-					volumes.add(dir);
+					volumes.put(dir, new HashMap<>());
 				}
 			}
 			if (workingDir != null) {
 				remoteVolumes.put(workingDir, workingDir); // $NON-NLS-1$
-				volumes.add(workingDir);
-			}
-			if (commandDir != null) {
-				remoteVolumes.put(commandDir, commandDir); // $NON-NLS-1$
-				volumes.add(commandDir);
+				volumes.put(workingDir, new HashMap<>());
 			}
 			builder = builder.volumes(volumes);
 		} else {
@@ -781,9 +979,6 @@ public class ContainerLauncher {
 			}
 			if (workingDir != null) {
 				volumes.add(workingDir + ":" + workingDir + ":Z"); //$NON-NLS-1$ //$NON-NLS-2$
-			}
-			if (commandDir != null) {
-				volumes.add(commandDir + ":" + commandDir + ":Z"); //$NON-NLS-1$ //$NON-NLS-2$
 			}
 			hostBuilder = hostBuilder.binds(volumes);
 		}
@@ -1003,6 +1198,24 @@ public class ContainerLauncher {
 		t.start();
 	}
 
+//	private class ID {
+//		private Integer uid;
+//		private Integer gid;
+//
+//		public ID(Integer uid, Integer gid) {
+//			this.uid = uid;
+//			this.gid = gid;
+//		}
+//
+//		public Integer getuid() {
+//			return uid;
+//		}
+//
+//		public Integer getgid() {
+//			return gid;
+//		}
+//	}
+
 	/**
 	 * Fetch directories from Container and place them in a specified location.
 	 * 
@@ -1037,8 +1250,140 @@ public class ContainerLauncher {
 		}
 
 		CopyVolumesFromImageJob job = new CopyVolumesFromImageJob(connection,
-				imageName, containerDirs, hostDir);
+				imageName, containerDirs, new ArrayList<String>(), hostDir);
 		job.schedule();
+		return 0;
+	}
+
+	/**
+	 * Fetch directories from Container and place them in a specified location.
+	 * 
+	 * @param connectionUri
+	 *            - uri of connection to use
+	 * @param imageName
+	 *            - name of image to use
+	 * @param containerDirs
+	 *            - list of directories to copy
+	 * @param excludedDirs
+	 *            - list of directories not to copy
+	 * @param hostDir
+	 *            - host directory to copy directories to
+	 * @return 0 if successful, -1 if failure occurred
+	 * 
+	 * @since 4.0
+	 */
+	public int fetchContainerDirs(String connectionUri, String imageName,
+			List<String> containerDirs, List<String> excludedDirs, IPath hostDir) {
+		// Try and use the specified connection that was used before,
+		// otherwise, open an error
+		final IDockerConnection connection = DockerConnectionManager
+				.getInstance().getConnectionByUri(connectionUri);
+		if (connection == null) {
+			Display.getDefault()
+					.syncExec(() -> MessageDialog.openError(
+							PlatformUI.getWorkbench().getActiveWorkbenchWindow()
+									.getShell(),
+							DVMessages.getString(ERROR_LAUNCHING_CONTAINER),
+							DVMessages.getFormattedString(
+									ERROR_NO_CONNECTION_WITH_URI,
+									connectionUri)));
+			return -1;
+		}
+
+		CopyVolumesFromImageJob job = new CopyVolumesFromImageJob(connection,
+				imageName, containerDirs, excludedDirs, hostDir);
+		job.schedule();
+		return 0;
+	}
+
+	/**
+	 * Fetch directories from Container and place them in a specified location.
+	 * This method will wait for copy job to complete before returning.
+	 * 
+	 * @param connectionUri
+	 *            - uri of connection to use
+	 * @param imageName
+	 *            - name of image to use
+	 * @param containerDirs
+	 *            - list of directories to copy
+	 * @param hostDir
+	 *            - host directory to copy directories to
+	 * @return 0 if successful, -1 if failure occurred
+	 * 
+	 * @since 4.0
+	 */
+	public int fetchContainerDirsSync(String connectionUri, String imageName,
+			List<String> containerDirs, IPath hostDir) {
+		// Try and use the specified connection that was used before,
+		// otherwise, open an error
+		final IDockerConnection connection = DockerConnectionManager
+				.getInstance().getConnectionByUri(connectionUri);
+		if (connection == null) {
+			Display.getDefault()
+					.syncExec(() -> MessageDialog.openError(
+							PlatformUI.getWorkbench().getActiveWorkbenchWindow()
+									.getShell(),
+							DVMessages.getString(ERROR_LAUNCHING_CONTAINER),
+							DVMessages.getFormattedString(
+									ERROR_NO_CONNECTION_WITH_URI,
+									connectionUri)));
+			return -1;
+		}
+
+		CopyVolumesFromImageJob job = new CopyVolumesFromImageJob(connection,
+				imageName, containerDirs, new ArrayList<String>(), hostDir);
+		job.schedule();
+		try {
+			job.join();
+		} catch (InterruptedException e) {
+			return -1;
+		}
+		return 0;
+	}
+
+	/**
+	 * Fetch directories from Container and place them in a specified location.
+	 * This method will wait for copy job to complete before returning.
+	 * 
+	 * @param connectionUri
+	 *            - uri of connection to use
+	 * @param imageName
+	 *            - name of image to use
+	 * @param containerDirs
+	 *            - list of directories to copy
+	 * @param hostDir
+	 *            - host directory to copy directories to
+	 * @return 0 if successful, -1 if failure occurred
+	 * 
+	 * @since 4.0
+	 */
+	public int fetchContainerDirsSync(String connectionUri, String imageName,
+			List<String> containerDirs, List<String> excludedDirs,
+			IPath hostDir) {
+		// Try and use the specified connection that was used before,
+		// otherwise, open an error
+		final IDockerConnection connection = DockerConnectionManager
+				.getInstance().getConnectionByUri(connectionUri);
+		if (connection == null) {
+			Display.getDefault()
+					.syncExec(() -> MessageDialog.openError(
+							PlatformUI.getWorkbench().getActiveWorkbenchWindow()
+									.getShell(),
+							DVMessages.getString(ERROR_LAUNCHING_CONTAINER),
+							DVMessages.getFormattedString(
+									ERROR_NO_CONNECTION_WITH_URI,
+									connectionUri)));
+			return -1;
+		}
+
+		CopyVolumesFromImageJob job = new CopyVolumesFromImageJob(connection,
+				imageName, containerDirs, excludedDirs, hostDir);
+		job.schedule();
+		try {
+			job.join();
+		} catch (InterruptedException e) {
+			return -1;
+		}
 		return 0;
 	}
 
@@ -1057,7 +1402,7 @@ public class ContainerLauncher {
 	 * @param command
 	 *            - command to run
 	 * @param commandDir
-	 *            - directory path to command
+	 *            - directory path to command (unused)
 	 * @param workingDir
 	 *            - where to run command
 	 * @param additionalDirs
@@ -1074,8 +1419,6 @@ public class ContainerLauncher {
 	 *            - labels to apply to Container
 	 * @param keepContainer
 	 *            - boolean whether to keep Container when done
-	 * @param uid
-	 *            - the user id for the container process
 	 * @return Process that can be used to check for completion and for routing
 	 *         stdout/stderr
 	 * 
@@ -1083,18 +1426,94 @@ public class ContainerLauncher {
 	 */
 	public Process runCommand(String connectionName, String imageName, IProject project, 
 			IErrorMessageHolder errMsgHolder, String command,
-			String commandDir,
+			@SuppressWarnings("unused") String commandDir,
 			String workingDir,
 			List<String> additionalDirs, Map<String, String> origEnv,
 			Properties envMap, boolean supportStdin,
 			boolean privilegedMode, HashMap<String, String> labels,
 			boolean keepContainer, Integer uid) {
+		
+		final List<String> cmdList = getCmdList(command);
+		return runCommand(connectionName, imageName, project, errMsgHolder,
+				cmdList, workingDir, additionalDirs, origEnv, envMap,
+				supportStdin, privilegedMode, labels, keepContainer, uid);
+	}
+
+	/**
+	 * Create a Process to run an arbitrary command in a Container with uid of
+	 * caller so any files created are accessible to user.
+	 * 
+	 * @param connectionName
+	 *            - uri of connection to use
+	 * @param imageName
+	 *            - name of image to use
+	 * @param project
+	 *            - Eclipse project
+	 * @param errMsgHolder
+	 *            - holder for any error messages
+	 * @param cmdList
+	 *            - command to run as list of String
+	 * @param workingDir
+	 *            - where to run command
+	 * @param additionalDirs
+	 *            - additional directories to mount
+	 * @param origEnv
+	 *            - original environment if we are appending to existing
+	 * @param envMap
+	 *            - new environment
+	 * @param supportStdin
+	 *            - support using stdin
+	 * @param privilegedMode
+	 *            - run in privileged mode
+	 * @param labels
+	 *            - labels to apply to Container
+	 * @param keepContainer
+	 *            - boolean whether to keep Container when done
+	 * @return Process that can be used to check for completion and for routing
+	 *         stdout/stderr
+	 * 
+	 * @since 4.0
+	 */
+	public Process runCommand(String connectionName, String imageName,
+			IProject project, IErrorMessageHolder errMsgHolder,
+			List<String> cmdList,
+			String workingDir, List<String> additionalDirs,
+			Map<String, String> origEnv, Properties envMap,
+			boolean supportStdin, boolean privilegedMode,
+			HashMap<String, String> labels, boolean keepContainer, Integer uid) {
+//		Integer uid = null;
+//		Integer gid = null;
+//		// For Unix, make sure that the user id is passed with the run
+//		// so any output files are accessible by this end-user
+//		String os = System.getProperty("os.name"); //$NON-NLS-1$
+//		if (os.indexOf("nux") > 0) { //$NON-NLS-1$
+//			// first try and see if we have already run a command on this
+//			// project
+//			ID ugid = fidMap.get(project);
+//			if (ugid == null) {
+//				try {
+//					uid = (Integer) Files.getAttribute(
+//							project.getLocation().toFile().toPath(),
+//							"unix:uid"); //$NON-NLS-1$
+//					gid = (Integer) Files.getAttribute(
+//							project.getLocation().toFile().toPath(),
+//							"unix:gid"); //$NON-NLS-1$
+//					ugid = new ID(uid, gid);
+//					// store the uid for possible later usage
+//					fidMap.put(project, ugid);
+//				} catch (IOException e) {
+//					// do nothing...leave as null
+//				} // $NON-NLS-1$
+//			} else {
+//				uid = ugid.getuid();
+//				gid = ugid.getgid();
+//			}
+//		}
 
 		final List<String> env = new ArrayList<>();
 		env.addAll(toList(origEnv));
 		env.addAll(toList(envMap));
 
-		final List<String> cmdList = getCmdList(command);
 
 		final Map<String, List<IDockerPortBinding>> portBindingsMap = new HashMap<>();
 
@@ -1157,7 +1576,8 @@ public class ContainerLauncher {
 		// Note we only pass volumes to the config if we have a
 		// remote daemon. Local mounted volumes are passed
 		// via the HostConfig binds setting
-		final Set<String> remoteVolumes = new TreeSet<>();
+		@SuppressWarnings("rawtypes")
+		final Map<String, Map> remoteVolumes = new HashMap<>();
 		final Map<String, String> remoteDataVolumes = new HashMap<>();
 		final Set<String> readOnlyVolumes = new TreeSet<>();
 		if (!((DockerConnection) connection).isLocal()) {
@@ -1168,7 +1588,7 @@ public class ContainerLauncher {
 			if (additionalDirs != null) {
 				for (String dir : additionalDirs) {
 					IPath p = new Path(dir).removeTrailingSeparator();
-					remoteVolumes.add(p.toPortableString());
+					remoteVolumes.put(p.toPortableString(), new HashMap<>());
 					remoteDataVolumes.put(p.toPortableString(),
 							p.toPortableString());
 					if (dir.contains(":")) { //$NON-NLS-1$
@@ -1192,13 +1612,7 @@ public class ContainerLauncher {
 			}
 			if (workingDir != null) {
 				IPath p = new Path(workingDir).removeTrailingSeparator();
-				remoteVolumes.add(p.toPortableString());
-				remoteDataVolumes.put(p.toPortableString(),
-						p.toPortableString());
-			}
-			if (commandDir != null) {
-				IPath p = new Path(commandDir).removeTrailingSeparator();
-				remoteVolumes.add(p.toPortableString());
+				remoteVolumes.put(p.toPortableString(), new HashMap<>());
 				remoteDataVolumes.put(p.toPortableString(),
 						p.toPortableString());
 			}
@@ -1245,11 +1659,6 @@ public class ContainerLauncher {
 				volumes.add(p.toPortableString() + ":" + p.toPortableString() //$NON-NLS-1$
 						+ ":Z"); //$NON-NLS-1$
 			}
-			if (commandDir != null) {
-				IPath p = new Path(commandDir).removeTrailingSeparator();
-				volumes.add(p.toPortableString() + ":" + p.toPortableString() //$NON-NLS-1$
-						+ ":Z"); //$NON-NLS-1$
-			}
 			List<String> volumeList = new ArrayList<>(volumes);
 			hostBuilder = hostBuilder.binds(volumeList);
 			if (!volumesFrom.isEmpty()) {
@@ -1290,11 +1699,6 @@ public class ContainerLauncher {
 					// ignore
 				}
 			}
-		}
-		try {
-			((DockerConnection) conn).startContainer(id, null);
-		} catch (DockerException | InterruptedException e) {
-			Activator.log(e);
 		}
 
 		// remove all read-only remote volumes from our list of remote

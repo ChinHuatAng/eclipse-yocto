@@ -16,7 +16,7 @@ public class YoctoCropsContainerLauncher extends ContainerLauncher {
 			List<String> additionalDirs, Map<String, String> origEnv, Properties envMap, boolean supportStdin,
 			boolean privilegedMode, HashMap<String, String> labels, boolean keepContainer, Integer uid) {
 		
-		String pokyEntryCommand = "--workdir " + workingDir + " --cmd '" + command + "'"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+		String pokyEntryCommand = "/usr/bin/dumb-init -- /usr/bin/poky-entry.py --workdir " + workingDir + " --cmd '" + command + "'"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
 				
 		return super.runCommand(connectionName, imageName, project, errMsgHolder, pokyEntryCommand, commandDir, workingDir,
 				additionalDirs, origEnv, envMap, supportStdin, privilegedMode, labels, keepContainer, uid);
