@@ -1707,6 +1707,7 @@ public class ContainerLauncher {
 			remoteDataVolumes.remove(readonly);
 		}
 		return new ContainerCommandProcess(connection, imageName, containerId,
+				null,
 				remoteDataVolumes,
 				keepContainer);
 	}
